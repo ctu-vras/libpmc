@@ -75,17 +75,17 @@ class SubscriptionRenewalThread(PeriodicTaskThread):
         return True
 
 
-class CheckPathDelayThread(PeriodicTaskThread):
+class CheckOffsetAndPathDelayThread(PeriodicTaskThread):
     """
     A thread that periodically calls GET CURRENT_DATA_SET so that path delay can be re-estimated.
     """
-    def __init__(self, watchdog, stop_event):
+    def __init__(self, watchdog, stop_event, period=10):
         """
         :param PtpSyncWatchdog watchdog: The watchdog object.
         :param Event stop_event: The event that can stop execution of this thread.
         """
         assert isinstance(watchdog, PtpSyncWatchdog)
-        super(CheckPathDelayThread, self).__init__(10, stop_event)
+        super(CheckOffsetAndPathDelayThread, self).__init__(period, stop_event)
         self.watchdog = watchdog
 
     def execute(self):
@@ -93,7 +93,7 @@ class CheckPathDelayThread(PeriodicTaskThread):
             self.watchdog.send_get_message(pmc.CURRENT_DATA_SET)
         except BaseException as e:
             if not isinstance(e, KeyboardInterrupt):
-                self.watchdog.print_error("Error requesting path delay (" + str(type(e)) + "): " + str(e))
+                self.watchdog.print_error("Error requesting offset and path delay (" + str(type(e)) + "): " + str(e))
             if not isinstance(e, Exception):
                 return False
         return True
@@ -223,7 +223,7 @@ class PtpSyncWatchdog:
     A watchdog for PTP sync estimation.
     """
     def __init__(self, socket, ptp_config, offset_threshold=100, offset_std_threshold=None, num_offset_values=5,
-                 callback=None, subscribe_duration=180, subscribe_renewal=60):
+                 callback=None, use_subscribe=True, subscribe_duration=180, subscribe_renewal=60, uds_address=None):
         """
         :param pmc.SockUnix socket: The (already open) UDS socket used for communication.
         :param pmc.Config ptp_config: The PTP config to apply to the socket and messages.
@@ -232,9 +232,11 @@ class PtpSyncWatchdog:
         :param int num_offset_values: Length of history.
         :param Callable|None callback: The callback to be called every time something changes. If None, the sync quality
                                        estimate will be printed to stdout.
+        :param bool use_subscribe: Whether to check offsets using the subscription mechanism or via periodic polling.
         :param int subscribe_duration: The duration to be given to SUBSCRIBE_EVENTS_NP (in seconds).
         :param int subscribe_renewal: How often the event subscription should be renewed. This should be lower than
                                       subscribe_duration.
+        :param str uds_address: Path to the UDS socket to connect to.
         """
         assert isinstance(socket, pmc.SockUnix)
 
@@ -245,6 +247,7 @@ class PtpSyncWatchdog:
         self._stop_event = Event()
         self.callback = callback if callback is not None else self.print_status
 
+        self.use_subscribe = use_subscribe
         self.subscribe_duration = subscribe_duration
         self.subscribe_renewal = subscribe_renewal
 
@@ -256,7 +259,11 @@ class PtpSyncWatchdog:
 
         self.socket.setDefSelfAddress()
         self.socket.init()
-        self.socket.setPeerAddress(self.ptp_config)
+        if uds_address is None:
+            self.socket.setPeerAddress(self.ptp_config)
+        else:
+            self.socket.setPeerAddress(uds_address)
+        self.print_info("Connecting to socket " + self.socket.getPeerAddress())
 
         self.message.useConfig(self.ptp_config)
 
@@ -417,12 +424,14 @@ class PtpSyncWatchdog:
         self.send_get_message(pmc.PARENT_DATA_SET)  # gm identity
         self.send_get_message(pmc.CURRENT_DATA_SET)  # offset, path delay
 
-        self.subscribe_events()  # offset, port state
-
+        polling_period = 10 if self.use_subscribe else 1
         threads = [
-            SubscriptionRenewalThread(self, self._stop_event),
-            CheckPathDelayThread(self, self._stop_event)
+            CheckOffsetAndPathDelayThread(self, self._stop_event, polling_period),
         ]
+
+        if self.use_subscribe:
+            self.subscribe_events()  # offset, port state
+            threads.append(SubscriptionRenewalThread(self, self._stop_event))
 
         [t.start() for t in threads]
 
@@ -488,6 +497,14 @@ def main():
                              "(in ns). If not set, standard deviation is not taken into account.")
     parser.add_argument("-n", "--num-offset-values", default=5, type=int,
                         help="The length of history of offsets to look at.")
+    parser.add_argument("-u", "--uds-address", default=None, type=str,
+                        help="Path to the UDS socket to connect to. If not set, it will be taken from config file "
+                             "global section 'uds_address' config.")
+    parser.add_argument("--no-subscribe", action='store_true',
+                        help="If set, the SUBSCRIBE_EVENTS_NP mechanism will not be used for checking the offsets. "
+                             "Instead, periodic polling via GET CURRENT_DATA_SET will be used. Choose this option "
+                             "either if you need to connect to a read-only UDS socket (which does not support "
+                             "subscriptions), or if the PTP client you are connecting to is not Linuxptp.")
 
     args = parser.parse_args()
 
@@ -498,7 +515,8 @@ def main():
 
     with contextlib.closing(pmc.SockUnix()) as sock:
         watchdog = PtpSyncWatchdog(sock, config, args.offset_threshold, args.offset_std_threshold,
-                                   args.num_offset_values)
+                                   args.num_offset_values, use_subscribe=not args.no_subscribe,
+                                   uds_address=args.uds_address)
         watchdog.watch()
 
 
